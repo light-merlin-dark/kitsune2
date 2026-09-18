@@ -70,11 +70,16 @@ impl GossipRoundState {
 #[cfg(test)]
 mod tests {
     use crate::error::K2GossipError;
-    use crate::protocol::{K2GossipAgentsMessage, encode_agent_infos};
+    use crate::protocol::{
+        AcceptResponseMessage, GossipMessage, K2GossipAgentsMessage,
+        K2GossipNoDiffMessage, encode_agent_infos,
+    };
     use crate::respond::harness::{RespondTestHarness, test_session_id};
-    use crate::state::RoundStage;
-    use kitsune2_api::DhtArc;
-    use kitsune2_test_utils::enable_tracing;
+    use crate::state::{RoundStage, RoundStageAccepted};
+    use kitsune2_api::{DhtArc, Timestamp, Url};
+    use kitsune2_dht::ArcSet;
+    use kitsune2_test_utils::{agent::AgentBuilder, enable_tracing};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn receive_agents() {
@@ -133,6 +138,228 @@ mod tests {
         assert_eq!(all_agents.len(), 2);
         assert!(all_agents.contains(&discovered_agent_1));
         assert!(all_agents.contains(&discovered_agent_2));
+    }
+
+    /// A peer can replay an advertisement cached before this node learned a
+    /// newer endpoint. Gossip must not let that stale record replace the URL
+    /// used to resolve the agent.
+    #[tokio::test]
+    async fn stale_cached_agent_info_does_not_replace_newer_endpoint() {
+        // Alice receives advertisements; Bob and Sue are remote peers.
+        let harness = RespondTestHarness::create().await;
+        let alice = harness.create_agent(DhtArc::FULL).await;
+        let bob = harness.create_agent(DhtArc::FULL).await;
+        let sue = harness.create_agent(DhtArc::FULL).await;
+
+        // Sue moves from the old endpoint to the new endpoint.
+        let old_url = Url::from_str("ws://test:80/old").unwrap();
+        let new_url = Url::from_str("ws://test:80/new").unwrap();
+        let now = Timestamp::now();
+        let older = AgentBuilder {
+            created_at: Some(now),
+            url: Some(Some(old_url.clone())),
+            ..Default::default()
+        }
+        .build(sue.local.clone());
+        let newer = AgentBuilder {
+            created_at: Some(now + Duration::from_secs(1)),
+            url: Some(Some(new_url.clone())),
+            ..Default::default()
+        }
+        .build(sue.local.clone());
+
+        // Sue sends Alice her current advertisement.
+        let session_id =
+            harness.insert_initiated_round_state(&alice, &sue).await;
+        harness
+            .gossip
+            .initiated_round_state
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .stage = RoundStage::NoDiff;
+        harness
+            .gossip
+            .respond_to_agents(
+                sue.url.clone().unwrap(),
+                K2GossipAgentsMessage {
+                    session_id,
+                    provided_agents: encode_agent_infos([newer.clone()])
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Bob later sends Alice his stale cached advertisement for Sue.
+        let session_id =
+            harness.insert_initiated_round_state(&alice, &bob).await;
+        harness
+            .gossip
+            .initiated_round_state
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .stage = RoundStage::NoDiff;
+        harness
+            .gossip
+            .respond_to_agents(
+                bob.url.clone().unwrap(),
+                K2GossipAgentsMessage {
+                    session_id,
+                    provided_agents: encode_agent_infos([older]).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Alice retains Sue's current advertisement in the peer store.
+        assert_eq!(
+            harness
+                .gossip
+                .peer_store
+                .get(sue.agent.clone())
+                .await
+                .unwrap()
+                .unwrap(),
+            newer
+        );
+
+        // Alice resolves Sue only through her current endpoint.
+        assert_eq!(
+            harness.known_peers.get_by_url(new_url).await.unwrap(),
+            vec![sue.agent.clone()]
+        );
+        assert!(
+            harness
+                .known_peers
+                .get_by_url(old_url)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A stale response selected before a bootstrap update may arrive after it.
+    #[tokio::test]
+    async fn in_flight_stale_gossip_response_does_not_replace_bootstrap_update()
+    {
+        // Alice receives updates; Bob caches Sue's old advertisement.
+        let alice_harness = RespondTestHarness::create().await;
+        let mut bob_harness = RespondTestHarness::create().await;
+        let alice = alice_harness.create_agent(DhtArc::FULL).await;
+        let bob = bob_harness.create_agent(DhtArc::FULL).await;
+        let sue = alice_harness.create_agent(DhtArc::FULL).await;
+        let old_url = Url::from_str("ws://test:80/old").unwrap();
+        let new_url = Url::from_str("ws://test:80/new").unwrap();
+        let now = Timestamp::now();
+        let older = AgentBuilder {
+            created_at: Some(now),
+            url: Some(Some(old_url.clone())),
+            ..Default::default()
+        }
+        .build(sue.local.clone());
+        let newer = AgentBuilder {
+            created_at: Some(now + Duration::from_secs(1)),
+            url: Some(Some(new_url.clone())),
+            ..Default::default()
+        }
+        .build(sue.local.clone());
+        bob_harness
+            .gossip
+            .peer_store
+            .insert(vec![older])
+            .await
+            .unwrap();
+
+        // Alice requests Sue while Bob still has Sue's old advertisement.
+        let session_id =
+            bob_harness.insert_accepted_round_state(&bob, &alice).await;
+        {
+            let accepted =
+                bob_harness.gossip.accepted_round_states.read().await;
+            let mut state = accepted
+                .get(alice.url.as_ref().unwrap())
+                .unwrap()
+                .lock()
+                .await;
+            state.stage = RoundStage::Accepted(RoundStageAccepted {
+                our_agents: vec![sue.agent.clone()],
+                common_arc_set: ArcSet::new(vec![DhtArc::FULL]).unwrap(),
+            });
+        }
+        bob_harness
+            .gossip
+            .respond_to_msg(
+                alice.url.clone().unwrap(),
+                GossipMessage::NoDiff(K2GossipNoDiffMessage {
+                    session_id: session_id.clone(),
+                    accept_response: Some(AcceptResponseMessage {
+                        missing_agents: vec![sue.agent.0.clone().into()],
+                        provided_agents: vec![],
+                        new_ops: vec![],
+                        updated_new_since: now.as_micros(),
+                    }),
+                    cannot_compare: false,
+                }),
+            )
+            .await
+            .unwrap();
+        let stale_response = bob_harness.wait_for_sent_response().await;
+        assert!(matches!(stale_response, GossipMessage::Agents(_)));
+
+        // Alice learns Sue's new advertisement while Bob's response is in flight.
+        alice_harness
+            .gossip
+            .peer_store
+            .insert(vec![newer.clone()])
+            .await
+            .unwrap();
+
+        // Bob's delayed response delivers Sue's old advertisement to Alice.
+        alice_harness
+            .insert_initiated_round_state(&alice, &bob)
+            .await;
+        {
+            let mut state =
+                alice_harness.gossip.initiated_round_state.lock().await;
+            let state = state.as_mut().unwrap();
+            state.session_id = session_id;
+            state.stage = RoundStage::NoDiff;
+        }
+        alice_harness
+            .gossip
+            .respond_to_msg(bob.url.clone().unwrap(), stale_response)
+            .await
+            .unwrap();
+
+        // Alice's peer store retains Sue's new advertisement.
+        assert_eq!(
+            alice_harness
+                .gossip
+                .peer_store
+                .get(sue.agent.clone())
+                .await
+                .unwrap()
+                .unwrap(),
+            newer
+        );
+
+        // Alice resolves Sue only through the new endpoint.
+        assert_eq!(
+            alice_harness.known_peers.get_by_url(new_url).await.unwrap(),
+            vec![sue.agent.clone()]
+        );
+        assert!(
+            alice_harness
+                .known_peers
+                .get_by_url(old_url)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
