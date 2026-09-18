@@ -1,25 +1,25 @@
 //! Known-peers index types.
 //!
-//! The [`KnownPeers`] trait provides an append-only index of all ever-seen
-//! agent infos, including those that are currently blocked.  It is used
-//! purely for URL → agent-ID resolution by the access control layer so that
-//! a blocked agent cannot slip through just because it shares a URL with a
-//! non-blocked agent.
+//! The [`KnownPeers`] trait indexes the newest accepted agent info for each
+//! agent, including agents that are currently blocked. It is used purely for
+//! URL → agent-ID resolution by the access control layer so that a blocked
+//! agent cannot slip through just because it shares a URL with a non-blocked
+//! agent.
 
 use crate::*;
 use std::sync::Arc;
 
-/// An append-only index of all ever-seen agent infos, including blocked ones.
+/// An index of the newest accepted agent info for each agent, including
+/// blocked ones.
 ///
 /// Unlike [`PeerStore`] this store never removes entries on blocking – its
-/// only purpose is to let the access control layer answer the question
-/// "which agents have we ever seen at this URL?".
+/// only purpose is to let the access control layer resolve the currently
+/// accepted URL for agents excluded from the active peer store.
 pub trait KnownPeers: 'static + Send + Sync + std::fmt::Debug {
-    /// Record agent infos without any block filtering.
+    /// Record agent infos already accepted by the peer store's version check.
     ///
-    /// This should be called with every batch of agent infos *before* any
-    /// block filter is applied, so that blocked agents remain discoverable
-    /// by URL.
+    /// This is called before block and expiry filters are applied, so blocked
+    /// or inactive agents remain discoverable by URL.
     fn record(
         &self,
         agent_infos: Vec<Arc<AgentInfoSigned>>,
