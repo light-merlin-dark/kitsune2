@@ -215,11 +215,19 @@ mod test {
     async fn stale_endpoint_batch_preserves_peer_access() {
         let old_url = make_url("old");
         let new_url = make_url("new");
+        let equal_url = make_url("equal");
         let now = Timestamp::now();
         let newer = AgentBuilder {
             agent: Some(AGENT_1),
             created_at: Some(now),
             url: Some(Some(new_url.clone())),
+            ..Default::default()
+        }
+        .build(TestLocalAgent::default());
+        let equal = AgentBuilder {
+            agent: Some(AGENT_1),
+            created_at: Some(now),
+            url: Some(Some(equal_url.clone())),
             ..Default::default()
         }
         .build(TestLocalAgent::default());
@@ -268,11 +276,21 @@ mod test {
                 Some(AccessDecision::Granted)
             );
 
-            // A later replay must preserve the same consistency.
-            peer_store.insert(vec![older.clone()]).await.unwrap();
+            // Later stale and equal-time replays keep the first accepted info.
+            peer_store
+                .insert(vec![older.clone(), equal.clone()])
+                .await
+                .unwrap();
             assert_eq!(
                 known_peers.get_by_url(new_url.clone()).await.unwrap(),
                 vec![AGENT_1]
+            );
+            assert!(
+                known_peers
+                    .get_by_url(equal_url.clone())
+                    .await
+                    .unwrap()
+                    .is_empty()
             );
         }
     }

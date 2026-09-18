@@ -18,6 +18,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub(crate) struct RespondTestHarness {
     pub(crate) gossip: K2Gossip,
+    pub(crate) known_peers: DynKnownPeers,
     pub(crate) rx: tokio::sync::mpsc::Receiver<(Url, Bytes)>,
     pub(crate) _transport: DynTransport,
 }
@@ -85,7 +86,12 @@ impl RespondTestHarness {
                 space_id: TEST_SPACE_ID,
                 peer_store: builder
                     .peer_store
-                    .create(builder.clone(), TEST_SPACE_ID, blocks, known_peers)
+                    .create(
+                        builder.clone(),
+                        TEST_SPACE_ID,
+                        blocks,
+                        known_peers.clone(),
+                    )
                     .await
                     .unwrap(),
                 local_agent_store: builder
@@ -120,6 +126,7 @@ impl RespondTestHarness {
                 _timeout_task: Default::default(),
                 _dht_update_task: Default::default(),
             },
+            known_peers,
             rx,
             _transport: transport,
         }

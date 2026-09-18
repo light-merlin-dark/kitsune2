@@ -221,6 +221,9 @@ type Listener =
 struct Inner {
     config: MemPeerStoreConfig,
     store: HashMap<AgentId, Arc<AgentInfoSigned>>,
+    /// Newest advertisement timestamp observed for each agent, including
+    /// advertisements excluded from the active peer store.
+    known_versions: HashMap<AgentId, Timestamp>,
     no_prune_until: std::time::Instant,
     listeners: Vec<Listener>,
     blocks: DynBlocks,
@@ -238,6 +241,7 @@ impl Inner {
         Self {
             config,
             store: HashMap::new(),
+            known_versions: HashMap::new(),
             no_prune_until,
             listeners: Vec::new(),
             blocks,
@@ -277,15 +281,41 @@ impl Inner {
     ) -> K2Result<Vec<Arc<AgentInfoSigned>>> {
         self.check_prune();
 
-        // Record all agent infos to the known-peers index *before* any block
-        // or expiry filtering so that the access control layer can still
-        // resolve URLs even for blocked agents.
-        self.known_peers.record(agent_list.clone()).await?;
+        // Select advertisement versions once for both the identity index and
+        // the active peer store. Track accepted versions within this batch so
+        // its input order cannot make an older advertisement win.
+        let mut batch_versions = HashMap::new();
+        let mut accepted = Vec::with_capacity(agent_list.len());
+        for agent in agent_list {
+            let newest = batch_versions
+                .get(&agent.agent)
+                .or_else(|| self.known_versions.get(&agent.agent));
+            if newest.is_some_and(|created_at| *created_at >= agent.created_at)
+            {
+                if newest
+                    .is_some_and(|created_at| *created_at > agent.created_at)
+                {
+                    tracing::debug!(
+                        ?agent.agent,
+                        ?agent.space,
+                        "Ignoring insert for older agent info"
+                    );
+                }
+                continue;
+            }
+
+            batch_versions.insert(agent.agent.clone(), agent.created_at);
+            accepted.push(agent);
+        }
+
+        // Record accepted identities before block or expiry filtering so URLs
+        // remain resolvable after an active peer is excluded or removed.
+        self.known_peers.record(accepted.clone()).await?;
+        self.known_versions.extend(batch_versions);
 
         let now = Timestamp::now();
-
         let mut inserted = Vec::new();
-        for agent in agent_list {
+        for agent in accepted {
             // Don't insert blocked agents.
             if self
                 .blocks
@@ -303,18 +333,6 @@ impl Inner {
             if agent.expires_at < now {
                 tracing::debug!(?agent.agent, ?agent.space, "Ignoring insert for expired agent info");
                 continue;
-            }
-
-            if let Some(a) = self.store.get(&agent.agent) {
-                // If we already have a newer (or equal) one, abort.
-                if a.created_at >= agent.created_at {
-                    // Don't want to log anything if we got the same agent info again. That's a
-                    // normal part of operation to rediscover existing agents.
-                    if a.created_at > agent.created_at {
-                        tracing::debug!(?agent.agent, ?agent.space, "Ignoring insert for older agent info");
-                    }
-                    continue;
-                }
             }
 
             self.store.insert(agent.agent.clone(), agent.clone());
