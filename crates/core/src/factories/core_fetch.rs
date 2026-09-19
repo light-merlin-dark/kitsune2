@@ -29,6 +29,15 @@ mod config {
         /// Default: 2.
         #[cfg_attr(feature = "schema", schemars(default))]
         pub parallel_request_count: u8,
+
+        /// Maximum number of op ids combined into one outgoing fetch request
+        /// message to a single peer. Only currently ready same-peer work is
+        /// combined; the task never waits to fill a batch.
+        ///
+        /// Default: 1.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub fetch_request_batch_size: usize,
     }
 
     impl Default for CoreFetchConfig {
@@ -36,6 +45,7 @@ mod config {
         fn default() -> Self {
             Self {
                 parallel_request_count: 2,
+                fetch_request_batch_size: 1,
             }
         }
     }
@@ -102,6 +112,14 @@ type OutgoingRequest = (OpId, Url);
 type QueuedRequest = (OpId, Url, u64);
 type IncomingRequest = (Vec<OpId>, Url);
 type IncomingResponse = (Vec<Op>, Url);
+
+/// Upper bound on the encoded size of one outgoing fetch request message.
+///
+/// The op-count batch limit bounds ids per request, but a count alone cannot
+/// bound encoded bytes. This cap is checked before sending and truncates the
+/// batch if exceeded. It bounds only the request; response sizes remain
+/// unbounded without a responder-side mechanism, which is out of scope here.
+const MAX_REQUEST_BYTES: usize = 4096;
 
 #[derive(Debug)]
 struct State {
@@ -286,6 +304,7 @@ impl CoreFetch {
                     space_id.clone(),
                     peer_meta_store.clone(),
                     Arc::downgrade(&transport),
+                    config.fetch_request_batch_size,
                 ));
             tasks.push(request_task);
         }
@@ -336,14 +355,23 @@ impl CoreFetch {
         space_id: SpaceId,
         peer_meta_store: DynPeerMetaStore,
         transport: WeakDynTransport,
+        batch_limit: usize,
     ) {
+        // Items drained while collecting a same-peer batch that belong to a
+        // different peer are retained here and processed by this task before
+        // it awaits the shared receiver again.
+        let mut deferred: std::collections::VecDeque<QueuedRequest> =
+            std::collections::VecDeque::new();
         loop {
             // Receive the next owned request inside a short lock scope, then
             // process it without holding the shared receiver guard so the
             // configured parallel workers can overlap their sends.
-            let request = {
-                let mut receiver = outgoing_request_rx.lock().await;
-                receiver.recv().await
+            let request = match deferred.pop_front() {
+                Some(item) => Some(item),
+                None => {
+                    let mut receiver = outgoing_request_rx.lock().await;
+                    receiver.recv().await
+                }
             };
             let Some((op_id, peer_url, generation)) = request else {
                 break;
@@ -356,6 +384,39 @@ impl CoreFetch {
                 break;
             };
 
+            // Immediate-flush same-peer batching: combine only work that is
+            // already queued right now, up to the configured count limit and
+            // the encoded byte cap. Never wait for additional work.
+            let mut batch: Vec<QueuedRequest> =
+                vec![(op_id, peer_url.clone(), generation)];
+            while batch_limit > 1 && batch.len() < batch_limit {
+                // If another worker currently owns the receiver, do not block
+                // on it; send what has already been gathered.
+                let Ok(mut receiver) = outgoing_request_rx.try_lock() else {
+                    break;
+                };
+                match receiver.try_recv() {
+                    Ok((id, url, generation)) if url == peer_url => {
+                        batch.push((id, url, generation))
+                    }
+                    Ok(item) => {
+                        drop(receiver);
+                        deferred.push_back(item);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            while batch.len() > 1
+                && serialize_request_message(
+                    batch.iter().map(|(id, _, _)| id.clone()).collect(),
+                )
+                .len()
+                    > MAX_REQUEST_BYTES
+            {
+                deferred.push_front(batch.pop().unwrap());
+            }
+
             // If peer URL is set as unresponsive, remove current request from state.
             let peer_url_unresponsive = match peer_meta_store
                 .get_unresponsive(peer_url.clone())
@@ -367,17 +428,24 @@ impl CoreFetch {
                     false
                 }
             };
+            let mut sendable: Vec<(OpId, u64)> =
+                Vec::with_capacity(batch.len());
             {
                 let mut lock = state.lock().expect("poisoned");
-                let key = (op_id.clone(), peer_url.clone());
-                if lock.generations.get(&key) != Some(&generation)
-                    || !lock.requests.contains_key(&key)
-                {
-                    Self::notify_listeners_if_queue_drained(lock);
-                    continue;
+                for (op_id, peer_url, generation) in batch {
+                    let key = (op_id.clone(), peer_url.clone());
+                    if lock.generations.get(&key) != Some(&generation)
+                        || !lock.requests.contains_key(&key)
+                    {
+                        continue;
+                    }
+                    if peer_url_unresponsive {
+                        lock.requests.remove(&key);
+                        continue;
+                    }
+                    sendable.push((op_id, generation));
                 }
-                if peer_url_unresponsive {
-                    lock.requests.remove(&key);
+                if sendable.is_empty() {
                     Self::notify_listeners_if_queue_drained(lock);
                     continue;
                 }
@@ -386,12 +454,14 @@ impl CoreFetch {
             tracing::debug!(
                 ?peer_url,
                 ?space_id,
-                ?op_id,
+                ids = ?sendable,
                 "sending fetch request"
             );
 
             // Send fetch request to peer.
-            let data = serialize_request_message(vec![op_id.clone()]);
+            let data = serialize_request_message(
+                sendable.iter().map(|(id, _)| id.clone()).collect(),
+            );
             if let Err(err) = transport
                 .send_module(
                     peer_url.clone(),
@@ -402,16 +472,17 @@ impl CoreFetch {
                 .await
             {
                 tracing::warn!(
-                    ?op_id,
                     ?peer_url,
                     "could not send fetch request: {err}."
                 );
                 // A delayed failure owns only its request generation, never
                 // another caller's later admission or other same-peer work.
                 let mut lock = state.lock().expect("poisoned");
-                let key = (op_id, peer_url);
-                if lock.generations.get(&key) == Some(&generation) {
-                    lock.requests.remove(&key);
+                for (op_id, generation) in sendable {
+                    let key = (op_id, peer_url.clone());
+                    if lock.generations.get(&key) == Some(&generation) {
+                        lock.requests.remove(&key);
+                    }
                 }
                 Self::notify_listeners_if_queue_drained(lock);
             }

@@ -165,6 +165,7 @@ async fn request_op_failures_are_purged_from_state() {
 async fn happy_op_fetch_from_multiple_agents() {
     let config = CoreFetchConfig {
         parallel_request_count: 5,
+        fetch_request_batch_size: 1,
     };
     let TestCase {
         fetch,
