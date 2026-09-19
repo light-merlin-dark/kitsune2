@@ -496,9 +496,11 @@ impl CoreFetch {
                 // pending metadata while allowing the caller to retry. An old
                 // completion must not retire a newer admission of the same key.
                 let mut lock = state.lock().expect("poison");
-                let key = (op_id, peer_url);
-                if lock.generations.get(&key) == Some(&generation) {
-                    lock.generations.remove(&key);
+                for (op_id, generation) in sendable {
+                    let key = (op_id, peer_url.clone());
+                    if lock.generations.get(&key) == Some(&generation) {
+                        lock.generations.remove(&key);
+                    }
                 }
             }
         }

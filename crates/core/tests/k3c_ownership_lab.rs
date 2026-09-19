@@ -24,6 +24,7 @@ struct Config {
 #[serde(rename_all = "camelCase")]
 struct Workers {
     parallel_request_count: u8,
+    fetch_request_batch_size: usize,
 }
 
 struct Fixture {
@@ -39,12 +40,18 @@ struct Fixture {
 impl Fixture {
     /// Build real fetch components with observable transport and store barriers.
     async fn new(workers: u8) -> Self {
+        Self::with_batch(workers, 1).await
+    }
+
+    /// Build controlled sends with an explicit batch size.
+    async fn with_batch(workers: u8, batch_size: usize) -> Self {
         let builder = default_test_builder().with_default_config().unwrap();
         builder
             .config
             .set_module_config(&Config {
                 core_fetch: Workers {
                     parallel_request_count: workers,
+                    fetch_request_batch_size: batch_size,
                 },
             })
             .unwrap();
@@ -572,5 +579,23 @@ async fn old_success_does_not_release_newer_send_ownership() {
     f.release(entry, false).await;
     f.release(newer, false).await;
     f.complete(&[a, sentinel]).await;
+    assert!(f.pending().await.is_empty());
+}
+
+/// Every member of a completed batch can be retried if its response was lost.
+#[tokio::test(start_paused = true)]
+async fn completed_batch_releases_each_send_generation_for_retry() {
+    let mut f = Fixture::with_batch(1, 8).await;
+    let ops: Vec<_> = (0..8).map(op).collect();
+    f.admit(&ops, None).await;
+    let first = f.entry().await;
+    assert_eq!(first.0.len(), ops.len());
+    f.release(first, false).await;
+    assert_eq!(f.pending().await.len(), ops.len());
+    f.admit(&ops, None).await;
+    let retry = f.entry().await;
+    assert_eq!(retry.0.len(), ops.len());
+    f.release(retry, false).await;
+    f.complete(&ops).await;
     assert!(f.pending().await.is_empty());
 }

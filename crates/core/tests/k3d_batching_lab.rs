@@ -30,10 +30,12 @@ struct Captures {
     incoming_metadata: Mutex<Vec<(OpId, Option<bytes::Bytes>)>>,
 }
 
+/// Construct a distinct in-memory peer endpoint for this fixture.
 fn url(n: u8) -> Url {
     Url::from_str(format!("ws://test:80/{n}")).unwrap()
 }
 
+/// Build a uniquely identified operation with a controlled payload size.
 fn op_with(index: usize, size: usize) -> MemoryOp {
     let mut payload = format!("k3d-op-{index:07}-").into_bytes();
     payload.resize(size, b'x');
@@ -80,7 +82,7 @@ impl Node {
             .expect_register_module_handler()
             .times(1)
             .returning(move |_, _, h| {
-                *register_slot.lock().unwrap() = Some(h);
+                *register_slot.lock().expect("poison") = Some(h);
             });
         let send_metrics = shared.clone();
         let send_route = route_to.clone();
@@ -89,7 +91,7 @@ impl Node {
                 let message =
                     K2FetchMessage::decode(data.clone()).expect("decode wire");
                 {
-                    let mut m = send_metrics.lock().unwrap();
+                    let mut m = send_metrics.lock().expect("poison");
                     match message.fetch_message_type() {
                         FetchMessageType::Request => {
                             m.request_messages += 1;
@@ -104,7 +106,7 @@ impl Node {
                 }
                 let handler = send_route
                     .lock()
-                    .unwrap()
+                    .expect("poison")
                     .clone()
                     .expect("peer handler registered");
                 // Deliver synchronously to the peer's real handler.
@@ -134,8 +136,9 @@ impl Node {
             let captures = caps_process.clone();
             Box::pin(async move {
                 if count_process {
-                    metrics.lock().unwrap().process_calls += 1;
-                    let mut seen = captures.incoming_metadata.lock().unwrap();
+                    metrics.lock().expect("poison").process_calls += 1;
+                    let mut seen =
+                        captures.incoming_metadata.lock().expect("poison");
                     for op in &ops {
                         seen.push((op.op_id.clone(), op.metadata.clone()));
                     }
@@ -149,7 +152,7 @@ impl Node {
             let metrics = m_retrieve.clone();
             Box::pin(async move {
                 if count_retrieve {
-                    metrics.lock().unwrap().retrieve_calls += 1;
+                    metrics.lock().expect("poison").retrieve_calls += 1;
                 }
                 store.retrieve_ops(ids).await
             })
@@ -163,8 +166,9 @@ impl Node {
             }
         }
         impl Report for Rep {
+            /// Record operation identity and byte attribution reported by fetch.
             fn fetched_op(&self, _s: SpaceId, _u: Url, op_id: OpId, size: u64) {
-                self.0.fetched.lock().unwrap().push((op_id, size));
+                self.0.fetched.lock().expect("poison").push((op_id, size));
             }
         }
         let report: DynReport = Arc::new(Rep(captures.clone()));
@@ -193,10 +197,12 @@ impl Node {
         }
     }
 
+    /// Copy captured message, byte, and host-processing counters.
     fn metrics_snapshot(&self) -> Metrics {
-        (*self.metrics.lock().unwrap()).clone()
+        (*self.metrics.lock().expect("poison")).clone()
     }
 
+    /// Read the number of operation identities still pending in fetch.
     async fn pending_count(&self) -> usize {
         self.fetch
             .get_state_summary()
@@ -208,6 +214,7 @@ impl Node {
             .sum()
     }
 
+    /// Wait until the requester has no pending operations.
     async fn await_drain(&self) {
         let (tx, rx) = oneshot::channel();
         self.fetch.notify_on_drained(tx);
@@ -249,6 +256,7 @@ struct Pair {
 }
 
 impl Pair {
+    /// Build real fetch components with observable transport and store barriers.
     async fn new(batch: Option<usize>, ops: &[MemoryOp]) -> Self {
         let shared = Arc::new(Mutex::new(Metrics::default()));
         let caps = Arc::new(Captures::default());
@@ -304,10 +312,12 @@ impl Pair {
     }
 }
 
+/// Label an explicitly invoked benchmark run with its comparison variant.
 fn variant() -> String {
     std::env::var("K3D_VARIANT").unwrap_or_else(|_| "candidate".into())
 }
 
+/// Select the batch size for an explicitly invoked benchmark run.
 fn candidate_batch() -> Option<usize> {
     if variant() == "candidate" {
         Some(
@@ -322,12 +332,11 @@ fn candidate_batch() -> Option<usize> {
 }
 
 /// Batching must combine same-peer work into one wire request on the
-/// candidate, while the baseline sends one message per op. On the baseline
-/// this same control asserts the unbatched count.
+/// candidate; the expectation is independent of benchmark environment variables.
 #[tokio::test]
 async fn same_peer_burst_forms_single_request() {
     let ops: Vec<MemoryOp> = (0..8).map(|i| op_with(i, 64)).collect();
-    let p = Pair::new(candidate_batch(), &ops).await;
+    let p = Pair::new(Some(8), &ops).await;
     let ids: Vec<OpId> = ops.iter().map(|o| o.compute_op_id()).collect();
     p.requester
         .fetch
@@ -344,11 +353,11 @@ async fn same_peer_burst_forms_single_request() {
         .unwrap();
     p.requester.await_drain().await;
     let m = p.requester.metrics_snapshot();
-    let expected_messages = if variant() == "candidate" { 1 } else { 8 };
+    let expected_messages = 1;
     assert_eq!(m.request_messages, expected_messages, "request messages");
     assert!(m.request_bytes <= 4096 * expected_messages);
     // Byte attribution is by op identity.
-    let mut got = p.requester.captures.fetched.lock().unwrap().clone();
+    let mut got = p.requester.captures.fetched.lock().expect("poison").clone();
     got.sort();
     let mut want: Vec<(OpId, u64)> = ops
         .iter()
@@ -382,6 +391,7 @@ async fn batch_size_one_matches_per_op_messages() {
     assert_eq!(m.request_messages, 4, "one message per op at batch size 1");
 }
 
+/// Convert fixture operations to requests without attached metadata.
 fn all_publish(ops: &[MemoryOp]) -> Vec<PublishOp> {
     ops.iter()
         .map(|op| PublishOp {
@@ -397,7 +407,7 @@ fn all_publish(ops: &[MemoryOp]) -> Vec<PublishOp> {
 #[tokio::test]
 async fn partial_response_and_metadata_survive_batching() {
     let ops: Vec<MemoryOp> = (0..8).map(|i| op_with(i, 64)).collect();
-    let p = Pair::new(candidate_batch(), &ops).await;
+    let p = Pair::new(Some(8), &ops).await;
     let mut publish = all_publish(&ops);
     publish[7].metadata = Some(bytes::Bytes::from_static(b"meta-7"));
     p.requester
@@ -412,7 +422,7 @@ async fn partial_response_and_metadata_survive_batching() {
         .captures
         .incoming_metadata
         .lock()
-        .unwrap()
+        .expect("poison")
         .clone();
     let id7 = ops[7].compute_op_id();
     let for_id7: Vec<_> =
@@ -436,12 +446,6 @@ async fn partial_response_and_metadata_survive_batching() {
 /// is reached. Candidate-only control (baseline has no cap logic to exceed).
 #[tokio::test]
 async fn byte_cap_truncates_oversized_batch() {
-    if variant() != "candidate" {
-        println!(
-            "LAB_JSON {{\"test\":\"byte_cap_truncates_oversized_batch\",\"skipped\":\"baseline\"}}"
-        );
-        return;
-    }
     let ops: Vec<MemoryOp> = (0..200).map(|i| op_with(i, 64)).collect();
     let p = Pair::new(Some(200), &ops).await;
     p.requester
@@ -465,7 +469,7 @@ async fn byte_cap_truncates_oversized_batch() {
 #[tokio::test]
 async fn duplicate_requests_and_responses_stay_consistent() {
     let ops: Vec<MemoryOp> = (0..4).map(|i| op_with(i, 64)).collect();
-    let p = Pair::new(candidate_batch(), &ops).await;
+    let p = Pair::new(Some(8), &ops).await;
     p.requester
         .fetch
         .request_ops(all_publish(&ops), url(1))
@@ -480,7 +484,7 @@ async fn duplicate_requests_and_responses_stay_consistent() {
     p.requester.await_drain().await;
     assert_eq!(p.requester.pending_count().await, 0);
     let m = p.requester.metrics_snapshot();
-    let fetched = p.requester.captures.fetched.lock().unwrap().len();
+    let fetched = p.requester.captures.fetched.lock().expect("poison").len();
     assert!(fetched >= 4, "all ops attributed at least once");
     // Duplicate admission did not create unbounded copies of work.
     assert!(
@@ -568,7 +572,8 @@ async fn workload_measurement() {
             sparse_delay_ns = Some(elapsed.as_nanos());
         }
         let m = p.requester.metrics_snapshot();
-        let fetched = p.requester.captures.fetched.lock().unwrap().len();
+        let fetched =
+            p.requester.captures.fetched.lock().expect("poison").len();
         let expected_fetched = hot_len + usize::from(sparse_op.is_some());
         assert_eq!(fetched, expected_fetched, "K3D_BATCHING attribution total");
         println!(
