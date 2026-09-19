@@ -17,13 +17,15 @@ use tokio::sync::{Semaphore, mpsc};
 #[derive(Debug)]
 struct Handler(Mutex<Option<Url>>);
 impl TxBaseHandler for Handler {
+    /// Capture the address assigned by the memory transport for fixture setup.
     fn new_listening_address(&self, url: Url) -> BoxFut<'static, ()> {
-        *self.0.lock().unwrap() = Some(url);
+        *self.0.lock().expect("poison") = Some(url);
         Box::pin(async {})
     }
 }
 impl TxHandler for Handler {}
 impl TxSpaceHandler for Handler {
+    /// Allow fixture peers to communicate without an access-control filter.
     fn is_any_agent_at_url_blocked(&self, _: &Url) -> K2Result<bool> {
         Ok(false)
     }
@@ -35,6 +37,7 @@ struct ObservedFetch {
     registered: mpsc::UnboundedSender<Instant>,
 }
 impl Fetch for ObservedFetch {
+    /// Forward operation admission to the wrapped real fetch implementation.
     fn request_ops(
         &self,
         ops: Vec<PublishOp>,
@@ -42,10 +45,12 @@ impl Fetch for ObservedFetch {
     ) -> BoxFut<'_, K2Result<()>> {
         self.inner.request_ops(ops, source)
     }
+    /// Forward drain registration and signal that the gossip waiter is installed.
     fn notify_on_drained(&self, tx: oneshot::Sender<()>) {
         self.inner.notify_on_drained(tx);
         self.registered.send(Instant::now()).unwrap();
     }
+    /// Expose pending operations from the wrapped real fetch implementation.
     fn get_state_summary(&self) -> BoxFut<'_, K2Result<FetchStateSummary>> {
         self.inner.get_state_summary()
     }
@@ -55,6 +60,7 @@ impl Fetch for ObservedFetch {
 struct Sink(mpsc::UnboundedSender<Instant>);
 impl TxBaseHandler for Sink {}
 impl TxModuleHandler for Sink {
+    /// Capture the incoming gossip message so the test can observe initiation.
     fn recv_module_msg(
         &self,
         _: Url,
@@ -67,6 +73,7 @@ impl TxModuleHandler for Sink {
     }
 }
 
+/// Create a memory transport and return its assigned listening address.
 async fn transport(builder: Arc<Builder>) -> (DynTransport, Url) {
     let handler = Arc::new(Handler(Mutex::new(None)));
     let tx = builder
@@ -79,11 +86,12 @@ async fn transport(builder: Arc<Builder>) -> (DynTransport, Url) {
     let url = handler
         .0
         .lock()
-        .unwrap()
+        .expect("poison")
         .clone()
         .expect("SETUP listening address");
     (tx, url)
 }
+/// Await a fixture barrier with a bounded timeout so missing work fails clearly.
 async fn recv<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
     tokio::time::timeout(Duration::from_secs(6), rx.recv())
         .await
@@ -91,16 +99,19 @@ async fn recv<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
         .unwrap()
 }
 
+/// Completing fetch wakes gossip after the initial delay, before the fallback.
 #[tokio::test]
 async fn arc_growth_completion_advances_initiation() {
     arc_growth_fixture(true).await;
 }
 
+/// An unfinished fetch preserves the normal gossip fallback delay.
 #[tokio::test]
 async fn pending_fetch_retains_delay_fallback() {
     arc_growth_fixture(false).await;
 }
 
+/// Exercise arc-growth gossip with retrieval either released or held open.
 async fn arc_growth_fixture(complete: bool) {
     kitsune2_test_utils::enable_tracing();
     const INITIAL: u32 = 200;
@@ -318,27 +329,12 @@ async fn arc_growth_fixture(complete: bool) {
     assert_eq!(store.retrieve_ops(vec![op_id]).await.unwrap().len(), 1);
     let after_release = initiation.duration_since(released);
     let after_registration = initiation.duration_since(registration);
-    let baseline = std::env::var("K3A_VARIANT")
-        .unwrap_or_else(|_| "candidate".into())
-        == "baseline";
-    if baseline {
-        assert!(
-            after_registration >= Duration::from_millis(NORMAL as u64),
-            "fallback must retain normal delay"
-        );
-    } else {
-        assert!(
-            after_release >= Duration::from_millis(INITIAL as u64),
-            "drain must retain initial delay"
-        );
-    }
+    assert!(
+        after_release >= Duration::from_millis(INITIAL as u64),
+        "drain must retain initial delay"
+    );
     println!(
-        "K3A_GOSSIP branch={} registration_to_initiation_ms={} release_to_initiation_ms={} initial_ms={INITIAL} normal_ms={NORMAL}",
-        if baseline {
-            "delay_expired"
-        } else {
-            "drain_plus_initial"
-        },
+        "K3A_GOSSIP branch=drain_plus_initial registration_to_initiation_ms={} release_to_initiation_ms={} initial_ms={INITIAL} normal_ms={NORMAL}",
         after_registration.as_millis(),
         after_release.as_millis()
     );
