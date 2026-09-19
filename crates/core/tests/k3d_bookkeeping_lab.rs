@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Construct a distinct in-memory peer endpoint for this fixture.
 fn url(n: u8) -> Url {
     Url::from_str(format!("ws://test:80/{n}")).unwrap()
 }
@@ -22,6 +23,7 @@ struct CapturingReport {
 }
 
 impl Report for CapturingReport {
+    /// Record operation identity and byte attribution reported by fetch.
     fn fetched_op(
         &self,
         _space: SpaceId,
@@ -29,7 +31,7 @@ impl Report for CapturingReport {
         op_id: OpId,
         size: u64,
     ) {
-        self.fetched.lock().unwrap().push((op_id, size));
+        self.fetched.lock().expect("poison").push((op_id, size));
     }
 }
 
@@ -42,6 +44,7 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Build real fetch components with observable transport and store barriers.
     async fn new() -> Self {
         let builder =
             Arc::new(default_test_builder().with_default_config().unwrap());
@@ -51,7 +54,7 @@ impl Fixture {
         let mut tx = MockTransport::new();
         tx.expect_register_module_handler().times(1).returning(
             move |_, _, h| {
-                *handler_slot.lock().unwrap() = Some(h);
+                *handler_slot.lock().expect("poison") = Some(h);
             },
         );
         tx.expect_send_module().returning(move |_, _, _, _| {
@@ -104,13 +107,14 @@ impl Fixture {
             .unwrap();
         Self {
             fetch,
-            handler: capture.lock().unwrap().take().unwrap(),
+            handler: capture.lock().expect("poison").take().unwrap(),
             sent,
             report,
             _transport: transport,
         }
     }
 
+    /// Request the supplied operations and establish the fixture admission barrier.
     async fn admit(&mut self, ops: &[MemoryOp], peer: u8) {
         self.fetch
             .request_ops(
@@ -139,6 +143,7 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Read the number of operation identities still pending in fetch.
     async fn pending_count(&self) -> usize {
         self.fetch
             .get_state_summary()
@@ -268,7 +273,7 @@ async fn response_bookkeeping_attributes_bytes_by_identity() {
     f.respond_raw(serialize_response_message(reversed), 1);
     f.await_pending(0).await;
 
-    let mut attributions = f.report.fetched.lock().unwrap().clone();
+    let mut attributions = f.report.fetched.lock().expect("poison").clone();
     attributions.sort();
     let mut expected: Vec<(OpId, u64)> = ops
         .iter()
@@ -287,7 +292,7 @@ async fn response_bookkeeping_attributes_bytes_by_identity() {
         vec![MetaOp::from(ops[0].clone()), MetaOp::from(ops[0].clone())];
     f.respond_raw(serialize_response_message(dup), 1);
     let deadline = Instant::now();
-    while f.report.fetched.lock().unwrap().len() < 5 {
+    while f.report.fetched.lock().expect("poison").len() < 5 {
         assert!(
             deadline.elapsed() < Duration::from_secs(30),
             "duplicate response processed"
@@ -295,7 +300,7 @@ async fn response_bookkeeping_attributes_bytes_by_identity() {
         tokio::task::yield_now().await;
     }
     f.await_pending(0).await;
-    let count = f.report.fetched.lock().unwrap().len();
+    let count = f.report.fetched.lock().expect("poison").len();
     assert_eq!(count, 5, "duplicate response re-attributes both entries");
 }
 
