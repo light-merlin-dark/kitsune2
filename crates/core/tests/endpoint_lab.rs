@@ -5,9 +5,11 @@ use kitsune2_core::factories::CoreKnownPeers;
 use kitsune2_test_utils::agent::{AgentBuilder, TestLocalAgent};
 use std::{collections::BTreeMap, hint::black_box, sync::Arc, time::Instant};
 
+/// Construct a distinct in-memory peer endpoint for this fixture.
 fn url(i: usize) -> Url {
     Url::from_str(format!("ws://lab.invalid:80/{i}")).unwrap()
 }
+/// Build a signed identity advertisement with controlled timestamp and endpoint.
 fn info(
     i: usize,
     t: i64,
@@ -27,12 +29,14 @@ fn info(
     }
     .build(TestLocalAgent::default())
 }
+/// Create the single-thread runtime used by deterministic component tests.
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
 }
 
+/// Compare endpoint results with a timestamp-ordered oracle over deterministic updates.
 #[test]
 fn equivalence() {
     runtime().block_on(async {
@@ -91,6 +95,7 @@ fn equivalence() {
     });
 }
 
+/// Populate retained identities with shared, unique, and absent endpoints.
 fn fixture(n: usize) -> Vec<Arc<AgentInfoSigned>> {
     (0..n)
         .map(|i| {
@@ -108,6 +113,7 @@ fn fixture(n: usize) -> Vec<Arc<AgentInfoSigned>> {
         .collect()
 }
 
+/// Measure an explicitly configured endpoint lookup or update workload.
 #[test]
 #[ignore = "run by paired lab driver"]
 fn measurement() {

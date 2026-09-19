@@ -4,6 +4,7 @@ use kitsune2_core::factories::{
     CorePeerAccessState, MemBlocks, MemPeerStore, MemPeerStoreConfig,
 };
 
+/// Create a signed, unexpired advertisement for peer-store listener checks.
 fn valid_info(
     i: usize,
     t: i64,
@@ -24,6 +25,7 @@ fn valid_info(
     .build(TestLocalAgent::default())
 }
 
+/// Apply advertisements through the real peer store and its access listeners.
 async fn listener_run(
     n: usize,
     case: &str,
@@ -134,6 +136,7 @@ async fn listener_run(
         "elapsed_ns":elapsed_ns,"setup_ns":setup_ns,"warmup_ns":warmup_ns,"epoch_micros":epoch})
 }
 
+/// Verify listener-driven access decisions survive endpoint changes and stale updates.
 #[test]
 fn listener_semantics() {
     tokio::runtime::Builder::new_current_thread()
@@ -152,6 +155,7 @@ fn listener_semantics() {
         });
 }
 
+/// Measure an explicitly configured update workload including access-control listeners.
 #[test]
 #[ignore = "run by paired lab driver"]
 fn listener_measurement() {
