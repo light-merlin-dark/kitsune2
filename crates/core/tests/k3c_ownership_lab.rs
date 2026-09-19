@@ -37,6 +37,7 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Build real fetch components with observable transport and store barriers.
     async fn new(workers: u8) -> Self {
         let builder = default_test_builder().with_default_config().unwrap();
         builder
@@ -57,7 +58,7 @@ impl Fixture {
             .expect_register_module_handler()
             .times(1)
             .returning(move |_, _, h| {
-                *capture.lock().unwrap() = Some(h);
+                *capture.lock().expect("poison") = Some(h);
             });
         transport
             .expect_send_module()
@@ -100,7 +101,10 @@ impl Fixture {
                 let ids: Vec<OpId> = ops
                     .into_iter()
                     .map(|op| {
-                        capture_meta.lock().unwrap().push(op.metadata.clone());
+                        capture_meta
+                            .lock()
+                            .expect("poison")
+                            .push(op.metadata.clone());
                         op.op_id
                     })
                     .collect();
@@ -130,7 +134,7 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let handler = handler.lock().unwrap().take().unwrap();
+        let handler = handler.lock().expect("poison").take().unwrap();
         Self {
             fetch,
             handler,
@@ -141,6 +145,7 @@ impl Fixture {
             _transport: transport,
         }
     }
+    /// Request the supplied operations and establish the fixture admission barrier.
     async fn admit(&self, ops: &[MemoryOp], metadata: Option<bytes::Bytes>) {
         self.fetch
             .request_ops(
@@ -155,13 +160,16 @@ impl Fixture {
             .await
             .unwrap();
     }
+    /// Wait until a worker enters a controlled transport send.
     async fn entry(&mut self) -> Entry {
         recv(&mut self.entries).await
     }
+    /// Complete one held send and wait for its success or failure continuation.
     async fn release(&mut self, entry: Entry, fail: bool) {
         entry.1.send(fail).unwrap();
         recv(&mut self.exits).await;
     }
+    /// Deliver the requested operations and wait for their host-store receipt.
     async fn complete(&mut self, ops: &[MemoryOp]) {
         self.handler
             .recv_module_msg(
@@ -175,6 +183,7 @@ impl Fixture {
             .unwrap();
         assert_eq!(recv(&mut self.stored).await.len(), ops.len());
     }
+    /// Inspect pending fetch identities without inferring state from timing.
     async fn pending(&self) -> HashSet<OpId> {
         self.fetch
             .get_state_summary()
@@ -185,6 +194,7 @@ impl Fixture {
             .collect()
     }
 }
+/// Await a fixture barrier with a bounded timeout so missing work fails clearly.
 async fn recv<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
     tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
@@ -194,14 +204,12 @@ async fn recv<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
 fn peer() -> Url {
     Url::from_str("ws://test:80/1").unwrap()
 }
+/// Construct a distinguishable operation with the supplied fixture identifier.
 fn op(n: usize) -> MemoryOp {
     MemoryOp::new(Timestamp::now(), n.to_le_bytes().to_vec())
 }
-fn candidate() -> bool {
-    std::env::var("K3C_VARIANT").unwrap_or_else(|_| "candidate".into())
-        == "candidate"
-}
 
+/// Cancelling a blocked batch leaves only admitted work, which drains normally.
 #[tokio::test(start_paused = true)]
 async fn cancelled_full_queue_has_no_orphans_and_notifies() {
     let mut f = Fixture::new(1).await;
@@ -237,7 +245,7 @@ async fn cancelled_full_queue_has_no_orphans_and_notifies() {
     blocked_rx.await.unwrap();
     let before = f.pending().await;
     let published_unadmitted = before.intersection(&cancelled_ids).count();
-    assert_eq!(published_unadmitted, if candidate() { 0 } else { 8 });
+    assert_eq!(published_unadmitted, 0);
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     let (notify_tx, mut notify_rx) = oneshot::channel();
@@ -275,6 +283,7 @@ async fn cancelled_full_queue_has_no_orphans_and_notifies() {
     assert_eq!(notified, Some(()));
 }
 
+/// Concurrent duplicates share an active send and preserve the first supplied metadata.
 #[tokio::test(start_paused = true)]
 async fn duplicates_and_metadata_upgrade_are_bounded() {
     let mut f = Fixture::new(1).await;
@@ -310,11 +319,6 @@ async fn duplicates_and_metadata_upgrade_are_bounded() {
     .await;
     assert_eq!(f.pending().await.len(), 1);
     f.release(held, false).await;
-    let copies = if candidate() { 1 } else { 34 };
-    for _ in 1..copies {
-        let entry = f.entry().await;
-        f.release(entry, false).await;
-    }
     // A sentinel gives a dequeue barrier behind all duplicate attempts.
     let sentinel = op(2);
     f.admit(std::slice::from_ref(&sentinel), None).await;
@@ -323,13 +327,14 @@ async fn duplicates_and_metadata_upgrade_are_bounded() {
     f.release(entry, false).await;
     f.complete(&[a, sentinel]).await;
     assert_eq!(
-        f.metadata.lock().unwrap()[0],
+        f.metadata.lock().expect("poison")[0],
         Some(bytes::Bytes::from_static(b"upgrade"))
     );
     assert!(f.pending().await.is_empty());
-    println!("K3C_DUPLICATES callers=34 pending_peak=1 sends={copies}");
+    println!("K3C_DUPLICATES callers=34 pending_peak=1 sends=1");
 }
 
+/// A failing send removes its own generation without deleting another request.
 #[tokio::test(start_paused = true)]
 async fn failed_send_does_not_erase_later_same_peer_admission() {
     let mut f = Fixture::new(2).await;
@@ -341,7 +346,7 @@ async fn failed_send_does_not_erase_later_same_peer_admission() {
     let newer = f.entry().await;
     f.release(old, true).await;
     let pending = f.pending().await;
-    assert_eq!(pending.contains(&b.compute_op_id()), candidate());
+    assert!(pending.contains(&b.compute_op_id()));
     assert!(!pending.contains(&a.compute_op_id()));
     println!(
         "K3C_PEER_FAILURE later_admission_survives={}",
@@ -352,6 +357,7 @@ async fn failed_send_does_not_erase_later_same_peer_admission() {
     assert!(f.pending().await.is_empty());
 }
 
+/// A delayed failure cannot erase a newer admission of the same operation.
 #[tokio::test(start_paused = true)]
 async fn old_generation_failure_does_not_erase_re_admission() {
     let mut f = Fixture::new(2).await;
@@ -363,7 +369,7 @@ async fn old_generation_failure_does_not_erase_re_admission() {
     f.admit(std::slice::from_ref(&a), None).await;
     let newer = f.entry().await;
     f.release(old, true).await;
-    assert_eq!(f.pending().await.contains(&a.compute_op_id()), candidate());
+    assert!(f.pending().await.contains(&a.compute_op_id()));
     f.release(newer, false).await;
     f.complete(&[a]).await;
     assert!(f.pending().await.is_empty());
@@ -387,6 +393,7 @@ async fn blocked_caller(
     caller
 }
 
+/// Cancellation preserves the admitted prefix and discards the blocked remainder.
 #[tokio::test(start_paused = true)]
 async fn partial_batch_cancellation_preserves_admitted_prefix() {
     let mut f = Fixture::new(1).await;
@@ -410,10 +417,7 @@ async fn partial_batch_cancellation_preserves_admitted_prefix() {
     )
     .await;
     let before = f.pending().await;
-    assert_eq!(
-        before.intersection(&batch_ids).count(),
-        if candidate() { 1 } else { 8 }
-    );
+    assert_eq!(before.intersection(&batch_ids).count(), 1);
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     let (tx, mut rx) = oneshot::channel();
@@ -453,6 +457,7 @@ async fn partial_batch_cancellation_preserves_admitted_prefix() {
     assert_eq!(notified, Some(()));
 }
 
+/// Cancelling a capacity waiter cannot erase another caller’s admitted work.
 #[tokio::test(start_paused = true)]
 async fn competing_waiters_cancel_without_erasing_survivor() {
     let mut f = Fixture::new(1).await;
@@ -494,7 +499,7 @@ async fn competing_waiters_cancel_without_erasing_survivor() {
     }
     // Both survivors passed the pre-reservation check while no generation
     // existed on candidate. The second must deduplicate after reservation.
-    let copies = if candidate() { 1 } else { 2 };
+    let copies = 1;
     for _ in 0..copies {
         let entry = f.entry().await;
         assert_eq!(entry.0, vec![id.clone()]);
@@ -508,7 +513,7 @@ async fn competing_waiters_cancel_without_erasing_survivor() {
     assert!(f.pending().await.contains(&id));
     f.complete(&[target]).await;
     assert_eq!(
-        f.metadata.lock().unwrap()[0],
+        f.metadata.lock().expect("poison")[0],
         Some(bytes::Bytes::from_static(b"waiter-upgrade"))
     );
     let rest: Vec<_> = std::iter::once(first)
@@ -525,4 +530,47 @@ async fn competing_waiters_cancel_without_erasing_survivor() {
     println!(
         "K3C_COMPETING waiters=3 cancelled=1 survivor_sends={copies} pending=0 queue=0 in_flight=0 metadata=upgraded"
     );
+}
+
+/// A completed send without a response must allow an explicit retry.
+#[tokio::test(start_paused = true)]
+async fn completed_send_can_be_retried_without_losing_metadata() {
+    let mut f = Fixture::new(1).await;
+    let a = op(1);
+    let metadata = bytes::Bytes::from_static(b"original");
+    f.admit(std::slice::from_ref(&a), Some(metadata.clone()))
+        .await;
+    let first = f.entry().await;
+    f.release(first, false).await;
+    assert!(f.pending().await.contains(&a.compute_op_id()));
+    f.admit(std::slice::from_ref(&a), None).await;
+    let retry = f.entry().await;
+    assert_eq!(retry.0, vec![a.compute_op_id()]);
+    f.release(retry, false).await;
+    f.complete(&[a]).await;
+    assert!(f.pending().await.is_empty());
+    assert_eq!(*f.metadata.lock().expect("poison"), vec![Some(metadata)]);
+}
+
+/// An old successful send cannot release the newer generation's deduplication guard.
+#[tokio::test(start_paused = true)]
+async fn old_success_does_not_release_newer_send_ownership() {
+    let mut f = Fixture::new(2).await;
+    let a = op(1);
+    f.admit(std::slice::from_ref(&a), None).await;
+    let old = f.entry().await;
+    f.complete(std::slice::from_ref(&a)).await;
+    f.admit(std::slice::from_ref(&a), None).await;
+    let newer = f.entry().await;
+    f.release(old, false).await;
+    f.admit(std::slice::from_ref(&a), None).await;
+    // The old worker is free: a sentinel proves no duplicate send was queued.
+    let sentinel = op(2);
+    f.admit(std::slice::from_ref(&sentinel), None).await;
+    let entry = f.entry().await;
+    assert_eq!(entry.0, vec![sentinel.compute_op_id()]);
+    f.release(entry, false).await;
+    f.release(newer, false).await;
+    f.complete(&[a, sentinel]).await;
+    assert!(f.pending().await.is_empty());
 }
