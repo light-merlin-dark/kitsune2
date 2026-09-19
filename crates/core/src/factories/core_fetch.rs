@@ -99,6 +99,7 @@ impl FetchFactory for CoreFetchFactory {
 }
 
 type OutgoingRequest = (OpId, Url);
+type QueuedRequest = (OpId, Url, u64);
 type IncomingRequest = (Vec<OpId>, Url);
 type IncomingResponse = (Vec<Op>, Url);
 
@@ -107,6 +108,8 @@ struct State {
     space_id: SpaceId,
     report: DynReport,
     requests: HashMap<OutgoingRequest, Option<Bytes>>,
+    generations: HashMap<OutgoingRequest, u64>,
+    next_generation: u64,
     notify_when_drained_senders: Vec<futures::channel::oneshot::Sender<()>>,
 }
 
@@ -129,7 +132,7 @@ impl State {
 #[derive(Debug)]
 struct CoreFetch {
     state: Arc<Mutex<State>>,
-    outgoing_request_tx: Sender<OutgoingRequest>,
+    outgoing_request_tx: Sender<QueuedRequest>,
     tasks: Vec<JoinHandle<()>>,
     op_store: DynOpStore,
     #[cfg(test)]
@@ -171,39 +174,50 @@ impl Fetch for CoreFetch {
             let new_op_ids =
                 self.op_store.filter_out_existing_ops(op_ids).await?;
 
-            // Add requests to state.
-            // These need to be added up front, before sending them to the outgoing
-            // request queue, otherwise the queue processes them faster than they're
-            // being added to state and the request logic fails.
-            // Add metadata if there isn't any but never overwrite existing metadata.
-            {
-                let mut lock = self.state.lock().expect("poisoned");
-                for op_id in &new_op_ids {
-                    let meta = metadata_map.remove(op_id).flatten();
-                    let key = (op_id.clone(), source.clone());
-                    let entry = lock.requests.entry(key).or_default();
-                    if entry.is_none() {
-                        *entry = meta;
+            for op_id in new_op_ids {
+                let key = (op_id.clone(), source.clone());
+                let meta = metadata_map.remove(&op_id).flatten();
+                // An existing generation is owned by fetch, not this caller.
+                {
+                    let mut lock = self.state.lock().expect("poisoned");
+                    if let Some(existing) = lock.requests.get_mut(&key) {
+                        if existing.is_none() {
+                            *existing = meta;
+                        }
+                        continue;
                     }
                 }
-            }
 
-            // Insert requests into fetch queue.
-            for op_id in new_op_ids {
-                if let Err(err) = self
-                    .outgoing_request_tx
-                    .send((op_id.clone(), source.clone()))
-                    .await
-                {
-                    tracing::error!(
-                        ?err,
-                        "could not insert fetch request into fetch queue"
-                    );
-                    // Remove request from state.
-                    let mut lock = self.state.lock().unwrap();
-                    lock.requests.remove(&(op_id, source.clone()));
-                    Self::notify_listeners_if_queue_drained(lock);
+                // Cancellation here drops only caller-owned input. No pending
+                // entry is published until capacity belongs to this request.
+                let permit = match self.outgoing_request_tx.reserve().await {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        tracing::error!(
+                            ?err,
+                            "could not reserve fetch queue capacity"
+                        );
+                        continue;
+                    }
+                };
+                let mut lock = self.state.lock().expect("poisoned");
+                // Another caller may have admitted this key while we waited.
+                if let Some(existing) = lock.requests.get_mut(&key) {
+                    if existing.is_none() {
+                        *existing = meta;
+                    }
+                    continue;
                 }
+                let generation =
+                    lock.next_generation.checked_add(1).ok_or_else(|| {
+                        K2Error::other("fetch generation exhausted")
+                    })?;
+                lock.next_generation = generation;
+                lock.generations.insert(key.clone(), generation);
+                lock.requests.insert(key, meta);
+                // No await between publication and send; the worker cannot
+                // inspect state until this critical section finishes.
+                permit.send((op_id, source.clone(), generation));
             }
 
             Ok(())
@@ -238,7 +252,7 @@ impl CoreFetch {
     ) -> Self {
         // Create a queue to process outgoing op requests. Requests are sent to peers.
         let (outgoing_request_tx, outgoing_request_rx) =
-            channel::<OutgoingRequest>(16_384);
+            channel::<QueuedRequest>(16_384);
         let outgoing_request_rx =
             Arc::new(tokio::sync::Mutex::new(outgoing_request_rx));
 
@@ -256,6 +270,8 @@ impl CoreFetch {
             space_id: space_id.clone(),
             report,
             requests: HashMap::new(),
+            generations: HashMap::new(),
+            next_generation: 0,
             notify_when_drained_senders: vec![],
         }));
 
@@ -316,7 +332,7 @@ impl CoreFetch {
 
     async fn outgoing_request_task(
         state: Arc<Mutex<State>>,
-        outgoing_request_rx: Arc<tokio::sync::Mutex<Receiver<OutgoingRequest>>>,
+        outgoing_request_rx: Arc<tokio::sync::Mutex<Receiver<QueuedRequest>>>,
         space_id: SpaceId,
         peer_meta_store: DynPeerMetaStore,
         transport: WeakDynTransport,
@@ -329,7 +345,7 @@ impl CoreFetch {
                 let mut receiver = outgoing_request_rx.lock().await;
                 receiver.recv().await
             };
-            let Some((op_id, peer_url)) = request else {
+            let Some((op_id, peer_url, generation)) = request else {
                 break;
             };
             tracing::debug!(?op_id, ?peer_url, "processing outgoing request");
@@ -351,27 +367,18 @@ impl CoreFetch {
                     false
                 }
             };
-            if peer_url_unresponsive {
-                state
-                    .lock()
-                    .expect("poisoned")
-                    .requests
-                    .remove(&(op_id.clone(), peer_url.clone()));
-            }
-
-            // Do nothing if op id is no longer in the set of requests to send.
-            //
-            // If the peer URL is unresponsive, the current request will have been removed
-            // from state and no request will be sent.
             {
-                let lock = state.lock().expect("poisoned");
-                if !lock
-                    .requests
-                    .contains_key(&(op_id.clone(), peer_url.clone()))
+                let mut lock = state.lock().expect("poisoned");
+                let key = (op_id.clone(), peer_url.clone());
+                if lock.generations.get(&key) != Some(&generation)
+                    || !lock.requests.contains_key(&key)
                 {
-                    // Check if the fetch queue is drained and notify listeners.
                     Self::notify_listeners_if_queue_drained(lock);
-
+                    continue;
+                }
+                if peer_url_unresponsive {
+                    lock.requests.remove(&key);
+                    Self::notify_listeners_if_queue_drained(lock);
                     continue;
                 }
             }
@@ -399,15 +406,26 @@ impl CoreFetch {
                     ?peer_url,
                     "could not send fetch request: {err}."
                 );
-                // Remove all requests to that peer and notify if drained.
+                // A delayed failure owns only its request generation, never
+                // another caller's later admission or other same-peer work.
                 let mut lock = state.lock().expect("poisoned");
-                lock.requests.retain(|(_, a), _| *a != peer_url);
+                let key = (op_id, peer_url);
+                if lock.generations.get(&key) == Some(&generation) {
+                    lock.requests.remove(&key);
+                }
                 Self::notify_listeners_if_queue_drained(lock);
             }
         }
     }
 
     fn notify_listeners_if_queue_drained(mut state: MutexGuard<State>) {
+        // Retire generation records at the same removal transition.
+        let State {
+            requests,
+            generations,
+            ..
+        } = &mut *state;
+        generations.retain(|key, _| requests.contains_key(key));
         // Check if the fetch queue is drained.
         if state.requests.is_empty() {
             // Notify all listeners that the fetch queue is drained.
