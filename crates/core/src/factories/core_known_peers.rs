@@ -1,7 +1,7 @@
 //! The core known-peers index implementation.
 
 use kitsune2_api::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -73,6 +73,10 @@ impl KnownPeers for CoreKnownPeers {
 struct Inner {
     /// Agent ID → newest advertisement timestamp and URL for that agent.
     store: HashMap<AgentId, (Timestamp, Option<Url>)>,
+    /// Derived from `store`: each agent with a URL belongs to exactly that
+    /// URL's set. Updated under the same mutex; retained identities stay in
+    /// `store` even when their newest advertisement has no URL.
+    by_url: HashMap<Url, HashSet<AgentId>>,
 }
 
 impl Inner {
@@ -86,19 +90,38 @@ impl Inner {
             ) {
                 continue;
             }
-            self.store.insert(
-                agent_info.agent.clone(),
-                (agent_info.created_at, agent_info.url.clone()),
-            );
+            let previous_url = self
+                .store
+                .insert(
+                    agent_info.agent.clone(),
+                    (agent_info.created_at, agent_info.url.clone()),
+                )
+                .and_then(|(_, url)| url);
+            if previous_url == agent_info.url {
+                continue;
+            }
+            if let Some(url) = previous_url
+                && let Some(agents) = self.by_url.get_mut(&url)
+            {
+                agents.remove(&agent_info.agent);
+                if agents.is_empty() {
+                    self.by_url.remove(&url);
+                }
+            }
+            if let Some(url) = &agent_info.url {
+                self.by_url
+                    .entry(url.clone())
+                    .or_default()
+                    .insert(agent_info.agent.clone());
+            }
         }
     }
 
     fn get_by_url(&self, url: &Url) -> Vec<AgentId> {
-        self.store
-            .iter()
-            .filter(|(_, (_, stored_url))| stored_url.as_ref() == Some(url))
-            .map(|(agent_id, _)| agent_id.clone())
-            .collect()
+        self.by_url
+            .get(url)
+            .map(|agents| agents.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
