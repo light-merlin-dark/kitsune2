@@ -543,8 +543,13 @@ impl CoreFetch {
                             op.data.len() as u64,
                         );
                     }
+                    // Membership against the pending map is proportional to
+                    // pending keys times returned ids unless the returned ids
+                    // are indexed by a set first.
+                    let processed_op_id_set: std::collections::HashSet<&OpId> =
+                        processed_op_ids.iter().collect();
                     lock.requests.retain(|(op_id, _), _| {
-                        !processed_op_ids.contains(op_id)
+                        !processed_op_id_set.contains(op_id)
                     });
                     Self::notify_listeners_if_queue_drained(lock);
                 }
