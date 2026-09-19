@@ -25,6 +25,7 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Build real fetch components with observable transport and store barriers.
     async fn new() -> Self {
         let builder =
             Arc::new(default_test_builder().with_default_config().unwrap());
@@ -34,7 +35,7 @@ impl Fixture {
         let mut tx = MockTransport::new();
         tx.expect_register_module_handler().times(1).returning(
             move |_, _, h| {
-                *capture.lock().unwrap() = Some(h);
+                *capture.lock().expect("poison") = Some(h);
             },
         );
         tx.expect_send_module().returning(move |_, _, _, _| {
@@ -100,7 +101,7 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let handler = handler.lock().unwrap().take().unwrap();
+        let handler = handler.lock().expect("poison").take().unwrap();
         Self {
             fetch,
             handler,
@@ -112,6 +113,7 @@ impl Fixture {
         }
     }
 
+    /// Request the supplied operations and establish the fixture admission barrier.
     async fn admit(&mut self, ops: &[MemoryOp], peer: u8) {
         self.fetch
             .request_ops(
@@ -145,12 +147,14 @@ impl Fixture {
         );
     }
 
+    /// Register a one-shot notification for the next empty pending state.
     fn waiter(&self) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         self.fetch.notify_on_drained(tx);
         rx
     }
 
+    /// Deliver a wire response and wait for the host store to process it.
     async fn respond(&mut self, ops: Vec<MemoryOp>, peer: u8) {
         let ids: Vec<_> = ops.iter().map(MemoryOp::compute_op_id).collect();
         self.handler
@@ -178,6 +182,7 @@ impl Fixture {
         );
     }
 
+    /// Inspect whether any operation is still pending in fetch.
     async fn empty(&self) -> bool {
         self.fetch
             .get_state_summary()
@@ -188,12 +193,15 @@ impl Fixture {
     }
 }
 
+/// Construct a distinct in-memory peer endpoint for this fixture.
 fn url(n: u8) -> Url {
     Url::from_str(format!("ws://test:80/{n}")).unwrap()
 }
+/// Construct a distinguishable operation with the supplied fixture identifier.
 fn op(n: u8) -> MemoryOp {
     MemoryOp::new(Timestamp::now(), vec![n])
 }
+/// Require a registered drain listener to complete within the test deadline.
 async fn completion(rx: oneshot::Receiver<()>) {
     tokio::time::timeout(Duration::from_millis(100), rx)
         .await
@@ -201,6 +209,7 @@ async fn completion(rx: oneshot::Receiver<()>) {
         .unwrap();
 }
 
+/// An empty fetch instance must notify a newly registered listener immediately.
 #[tokio::test]
 async fn zero_requests() {
     let f = Fixture::new().await;
@@ -208,6 +217,7 @@ async fn zero_requests() {
     assert_eq!(f.waiter().try_recv().unwrap(), Some(()));
 }
 
+/// Only the response completing the final pending operation may wake the waiter.
 #[tokio::test]
 async fn final_response_wakes_existing_waiter() {
     let mut f = Fixture::new().await;
@@ -229,6 +239,7 @@ async fn final_response_wakes_existing_waiter() {
     );
 }
 
+/// Completion wakes every live waiter even when another receiver was dropped.
 #[tokio::test]
 async fn completion_notification_all_waiters_and_dropped_receiver() {
     let mut f = Fixture::new().await;
@@ -250,6 +261,7 @@ async fn completion_notification_all_waiters_and_dropped_receiver() {
     completion(later).await;
 }
 
+/// Partial responses and storage failures preserve pending work across peers.
 #[tokio::test]
 async fn partial_error_and_multiple_peers() {
     let mut f = Fixture::new().await;
