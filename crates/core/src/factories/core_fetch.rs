@@ -108,6 +108,7 @@ struct State {
     space_id: SpaceId,
     report: DynReport,
     requests: HashMap<OutgoingRequest, Option<Bytes>>,
+    /// Generations still queued or sending; completed sends may be retried.
     generations: HashMap<OutgoingRequest, u64>,
     next_generation: u64,
     notify_when_drained_senders: Vec<futures::channel::oneshot::Sender<()>>,
@@ -177,14 +178,17 @@ impl Fetch for CoreFetch {
             for op_id in new_op_ids {
                 let key = (op_id.clone(), source.clone());
                 let meta = metadata_map.remove(&op_id).flatten();
-                // An existing generation is owned by fetch, not this caller.
+                // Deduplicate queued/in-flight sends, but allow explicit retries
+                // once a send has completed without delivering an operation.
                 {
-                    let mut lock = self.state.lock().expect("poisoned");
+                    let mut lock = self.state.lock().expect("poison");
                     if let Some(existing) = lock.requests.get_mut(&key) {
                         if existing.is_none() {
-                            *existing = meta;
+                            *existing = meta.clone();
                         }
-                        continue;
+                        if lock.generations.contains_key(&key) {
+                            continue;
+                        }
                     }
                 }
 
@@ -200,13 +204,15 @@ impl Fetch for CoreFetch {
                         continue;
                     }
                 };
-                let mut lock = self.state.lock().expect("poisoned");
+                let mut lock = self.state.lock().expect("poison");
                 // Another caller may have admitted this key while we waited.
                 if let Some(existing) = lock.requests.get_mut(&key) {
                     if existing.is_none() {
-                        *existing = meta;
+                        *existing = meta.clone();
                     }
-                    continue;
+                    if lock.generations.contains_key(&key) {
+                        continue;
+                    }
                 }
                 let generation =
                     lock.next_generation.checked_add(1).ok_or_else(|| {
@@ -214,7 +220,7 @@ impl Fetch for CoreFetch {
                     })?;
                 lock.next_generation = generation;
                 lock.generations.insert(key.clone(), generation);
-                lock.requests.insert(key, meta);
+                lock.requests.entry(key).or_insert(meta);
                 // No await between publication and send; the worker cannot
                 // inspect state until this critical section finishes.
                 permit.send((op_id, source.clone(), generation));
@@ -414,6 +420,15 @@ impl CoreFetch {
                     lock.requests.remove(&key);
                 }
                 Self::notify_listeners_if_queue_drained(lock);
+            } else {
+                // Sending is complete, but a response may never arrive. Keep
+                // pending metadata while allowing the caller to retry. An old
+                // completion must not retire a newer admission of the same key.
+                let mut lock = state.lock().expect("poison");
+                let key = (op_id, peer_url);
+                if lock.generations.get(&key) == Some(&generation) {
+                    lock.generations.remove(&key);
+                }
             }
         }
     }

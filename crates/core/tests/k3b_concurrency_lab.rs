@@ -41,6 +41,7 @@ struct FetchWorkersOverride {
 }
 
 impl FetchWorkersConfig {
+    /// Build the configuration selecting the requested number of fetch workers.
     fn with_workers(workers: u8) -> Self {
         Self {
             core_fetch: FetchWorkersOverride {
@@ -62,6 +63,7 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Build real fetch components with observable transport and store barriers.
     async fn new(workers: u8) -> Self {
         let builder = default_test_builder().with_default_config().unwrap();
         builder
@@ -81,7 +83,7 @@ impl Fixture {
         let mut tx = MockTransport::new();
         tx.expect_register_module_handler().times(1).returning(
             move |_, _, h| {
-                *capture.lock().unwrap() = Some(h);
+                *capture.lock().expect("poison") = Some(h);
             },
         );
         {
@@ -101,14 +103,14 @@ impl Fixture {
                         // Entry barrier: signal and hold until released.
                         *send_counts
                             .lock()
-                            .unwrap()
+                            .expect("poison")
                             .entry((peer.clone(), data.to_vec()))
                             .or_insert(0) += 1;
                         let (release_tx, release_rx) = oneshot::channel();
                         entry_tx.send((peer.clone(), release_tx)).unwrap();
                         // Exit barrier: held until the test releases.
                         let _ = release_rx.await;
-                        if fail_peers.lock().unwrap().contains(&peer) {
+                        if fail_peers.lock().expect("poison").contains(&peer) {
                             error_tx.send(peer).unwrap();
                             Err(K2Error::other("controlled send failure"))
                         } else {
@@ -169,7 +171,7 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let handler = handler.lock().unwrap().take().unwrap();
+        let handler = handler.lock().expect("poison").take().unwrap();
         Self {
             fetch,
             handler,
@@ -182,6 +184,7 @@ impl Fixture {
         }
     }
 
+    /// Request the supplied operations and establish the fixture admission barrier.
     async fn admit(&self, n: u8, peer: u8) -> OpId {
         let op = op(n);
         let id = op.compute_op_id();
@@ -198,6 +201,7 @@ impl Fixture {
         id
     }
 
+    /// Wait until a worker enters a controlled transport send.
     async fn entry(&mut self) -> (Url, Release) {
         tokio::time::timeout(Duration::from_secs(5), self.entries.recv())
             .await
@@ -232,6 +236,7 @@ impl Fixture {
         );
     }
 
+    /// Inspect pending fetch identities without inferring state from timing.
     async fn pending(&self, id: &OpId) -> bool {
         self.fetch
             .get_state_summary()
@@ -241,8 +246,9 @@ impl Fixture {
             .contains_key(id)
     }
 
+    /// Check that each recorded request contains exactly one operation identifier.
     fn assert_single_sends(&self) -> usize {
-        let counts = self.send_counts.lock().unwrap();
+        let counts = self.send_counts.lock().expect("poison");
         assert!(
             counts.values().all(|c| *c == 1),
             "K3B_DOUBLE_SEND each admitted request must be sent at most once: {counts:?}"
@@ -251,14 +257,17 @@ impl Fixture {
     }
 }
 
+/// Construct a distinct in-memory peer endpoint for this fixture.
 fn url(n: u8) -> Url {
     Url::from_str(format!("ws://test:80/{n}")).unwrap()
 }
 
+/// Construct a distinguishable operation with the supplied fixture identifier.
 fn op(n: u8) -> MemoryOp {
     MemoryOp::new(Timestamp::now(), vec![n])
 }
 
+/// Allow all held transport sends to complete.
 fn release_all(held: Vec<(Url, Release)>) {
     for (_, release) in held {
         let _ = release.send(());
@@ -390,7 +399,7 @@ async fn send_error_concurrent_with_inflight_response() {
 
     // Release the first send; the peer-2 send then runs (on the candidate it
     // was already held in flight) and fails, cleaning up that peer.
-    f.fail_peers.lock().unwrap().insert(url(2));
+    f.fail_peers.lock().expect("poison").insert(url(2));
     release_all(vec![first]);
     let second = f.entry().await;
     assert_eq!(second.0, url(2));
@@ -428,7 +437,7 @@ async fn send_failure_cleanup_racing_new_admission() {
     let (notify_tx, notify_rx) = oneshot::channel();
     f.fetch.notify_on_drained(notify_tx);
 
-    f.fail_peers.lock().unwrap().insert(url(1));
+    f.fail_peers.lock().expect("poison").insert(url(1));
     release_all(vec![first]);
     if let Ok(Some((_, release))) = second {
         release_all(vec![(url(1), release)]);
@@ -471,7 +480,7 @@ async fn shutdown_and_worker_cancellation() {
         !matches!(got, Ok(Some(_))),
         "K3B_SHUTDOWN no send may enter after drop"
     );
-    let counts = counts.lock().unwrap();
+    let counts = counts.lock().expect("poison");
     assert!(
         counts.values().all(|c| *c == 1),
         "K3B_DOUBLE_SEND no duplicate sends after cancellation: {counts:?}"

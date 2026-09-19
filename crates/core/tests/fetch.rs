@@ -265,10 +265,16 @@ async fn bob_comes_online_after_being_unresponsive() {
         .await
         .unwrap();
 
-    // Set up channel to get notified when Alice's request queue is drained.
-    let (alice_queue_drained_tx, alice_queue_drained_rx) =
-        futures::channel::oneshot::channel();
-    fetch_alice.notify_on_drained(alice_queue_drained_tx);
+    // Missing module handlers are silently ignored by MemTransport. Mark the
+    // peer explicitly so this fixture really exercises unresponsive filtering.
+    peer_meta_store_alice
+        .set_unresponsive(
+            peer_url_bob.clone(),
+            Timestamp::from_micros(i64::MAX),
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
 
     // Alice requests the ops from Bob.
     fetch_alice
@@ -286,10 +292,13 @@ async fn bob_comes_online_after_being_unresponsive() {
         .await
         .unwrap();
 
-    // Wait for Alice to attempt sending a request to Bob,
-    // which will set him as unresponsive and remove all requests from
-    // her request queue, resulting in the notification that her request
-    // queue is drained.
+    // Register after admission: an empty queue notifies immediately, so a
+    // listener registered before request_ops cannot prove these requests drained.
+    let (alice_queue_drained_tx, alice_queue_drained_rx) =
+        futures::channel::oneshot::channel();
+    fetch_alice.notify_on_drained(alice_queue_drained_tx);
+
+    // Wait until all requests to the unresponsive peer have been discarded.
     tokio::time::timeout(Duration::from_millis(100), alice_queue_drained_rx)
         .await
         .unwrap()
